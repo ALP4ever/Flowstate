@@ -1,0 +1,6 @@
+node_modules
+dist
+.vite
+.DS_Store
+.flowstate
+_pycache_

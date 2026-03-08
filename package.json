@@ -1,0 +1,165 @@
+{
+  "name": "flowstate-vscode",
+  "displayName": "FlowState",
+  "description": "Human-friendly local VCS UI for FlowState",
+  "version": "0.0.1",
+  "publisher": "flowstate",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "Source Control"
+  ],
+  "activationEvents": [
+    "onView:flowTimeline",
+    "onView:flowActions",
+    "onCommand:flow.refreshTimeline",
+    "onCommand:flow.init",
+    "onCommand:flow.takeSnapshot",
+    "onCommand:flow.goBack",
+    "onCommand:flow.clean",
+    "onCommand:flow.checkoutVersion",
+    "onCommand:flow.mergeVersions",
+    "onCommand:flow.squashVersion",
+    "onCommand:flow.deleteVersion",
+    "onCommand:flow.gc",
+    "onCommand:flow.compareWithCurrent"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "FlowState",
+      "properties": {
+        "flowstate.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional explicit path to Python interpreter for FlowState CLI."
+        },
+        "flowstate.cliPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to external FlowState cli.py. If empty, extension tries bundled core (core/cli.py) and then workspace cli.py."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "flow.refreshTimeline",
+        "title": "FlowState: Refresh Timeline",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "flow.init",
+        "title": "FlowState: Initialize FlowState",
+        "icon": "$(repo-create)"
+      },
+      {
+        "command": "flow.takeSnapshot",
+        "title": "FlowState: Take Snapshot",
+        "icon": "$(save)"
+      },
+      {
+        "command": "flow.goBack",
+        "title": "FlowState: Go Back",
+        "icon": "$(history)"
+      },
+      {
+        "command": "flow.clean",
+        "title": "FlowState: Clean",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "flow.checkoutVersion",
+        "title": "FlowState: Checkout Version"
+      },
+      {
+        "command": "flow.mergeVersions",
+        "title": "FlowState: Merge Versions"
+      },
+      {
+        "command": "flow.squashVersion",
+        "title": "FlowState: Squash Version"
+      },
+      {
+        "command": "flow.deleteVersion",
+        "title": "FlowState: Delete Version"
+      },
+      {
+        "command": "flow.gc",
+        "title": "FlowState: Run Garbage Collection"
+      },
+      {
+        "command": "flow.compareWithCurrent",
+        "title": "FlowState: Compare With Current"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "flowstate",
+          "title": "FlowState",
+          "icon": "media/flowstate.svg"
+        }
+      ]
+    },
+    "views": {
+      "flowstate": [
+        {
+          "id": "flowTimeline",
+          "name": "Timeline"
+        },
+        {
+          "id": "flowActions",
+          "name": "Actions"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "flow.refreshTimeline",
+          "when": "view == flowTimeline",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "flow.checkoutVersion",
+          "when": "view == flowTimeline && viewItem == version",
+          "group": "inline"
+        },
+        {
+          "command": "flow.mergeVersions",
+          "when": "view == flowTimeline && viewItem == version",
+          "group": "navigation"
+        },
+        {
+          "command": "flow.squashVersion",
+          "when": "view == flowTimeline && viewItem == version",
+          "group": "navigation"
+        },
+        {
+          "command": "flow.deleteVersion",
+          "when": "view == flowTimeline && viewItem == version",
+          "group": "navigation"
+        },
+        {
+          "command": "flow.compareWithCurrent",
+          "when": "view == flowTimeline && viewItem == version",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "npm exec -- tsc -p ./",
+    "watch": "npm exec -- tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.4"
+  }
+}
