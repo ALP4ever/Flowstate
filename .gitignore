@@ -3,4 +3,4 @@ dist
 .vite
 .DS_Store
 .flowstate
-_pycache_
+__pycache__
