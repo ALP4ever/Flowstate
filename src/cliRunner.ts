@@ -28,6 +28,13 @@ export interface CheckoutOptions {
   noTemp?: boolean;
 }
 
+interface CliJsonError {
+  ok: false;
+  error?: string;
+}
+
+type CliJsonResult<T> = (T & { ok: true }) | CliJsonError;
+
 class CliExecutionError extends Error {
   public readonly stdout: string;
   public readonly stderr: string;
@@ -91,7 +98,21 @@ export class FlowCliRunner {
   }
 
   public isInitialized(): boolean {
-    return fs.existsSync(path.join(this.workspaceRoot, ".flowstate"));
+    // Strong fast-path check: the FlowState SQLite database must exist.
+    const dbPath = path.join(this.workspaceRoot, ".flowstate", "flowstate.db");
+    return fs.existsSync(dbPath);
+  }
+
+  public async verifyInitialized(): Promise<{ initialized: boolean; error?: string }> {
+    const result = await this.runJson<{ initialized: boolean; error?: string }>([
+      "is-init",
+      "--path",
+      this.workspaceRoot,
+    ]);
+    if (!result || result.ok !== true) {
+      return { initialized: false, error: result?.error };
+    }
+    return { initialized: Boolean(result.initialized), error: result.error };
   }
 
   public async init(): Promise<void> {
@@ -99,7 +120,14 @@ export class FlowCliRunner {
   }
 
   public async takeSnapshot(message: string): Promise<void> {
-    await this.runBestEffort(["save", "-m", message, "--path", this.workspaceRoot]);
+    const args = ["save", "--path", this.workspaceRoot];
+    if (message.trim()) {
+      args.push("-m", message);
+    }
+    const result = await this.runJson<{ created: boolean }>(args);
+    if (!result || result.ok !== true) {
+      throw new Error(result?.error || "Failed to create snapshot.");
+    }
   }
 
   public async merge(versionA: string, versionB: string, message: string): Promise<void> {
@@ -142,23 +170,25 @@ export class FlowCliRunner {
   }
 
   public async isDirty(): Promise<boolean> {
-    const script = `
-import json
-import sys
-from engine import FlowStateEngine
-
-engine = FlowStateEngine(sys.argv[1])
-print(json.dumps({"dirty": engine.is_dirty()}))
-`.trim();
-    const parsed = await this.runPythonInline(script, [this.workspaceRoot]);
-    return Boolean(parsed && parsed.dirty === true);
+    const result = await this.runJson<{ dirty: boolean }>([
+      "status",
+      "--path",
+      this.workspaceRoot,
+    ]);
+    if (!result || result.ok !== true) {
+      return false;
+    }
+    return Boolean(result.dirty);
   }
 
   public async checkout(versionRef: string, options: CheckoutOptions = {}): Promise<void> {
+    const args = ["checkout", versionRef, "--path", this.workspaceRoot];
     if (options.saveTemp) {
-      await this.createTempSnapshot("Temporary save before checkout");
+      args.push("--save-temp");
+    } else if (options.noTemp) {
+      args.push("--no-temp");
     }
-    await this.runBestEffort(["checkout", versionRef, "--path", this.workspaceRoot]);
+    await this.runBestEffort(args);
   }
 
   public async squash(versionRef: string): Promise<void> {
@@ -166,47 +196,34 @@ print(json.dumps({"dirty": engine.is_dirty()}))
   }
 
   public async history(): Promise<FlowVersion[]> {
-    const json = await this.runJsonIfSupported(["history", "--path", this.workspaceRoot]);
-    if (json && Array.isArray(json.history)) {
-      return json.history
-        .map((item: unknown) => this.normalizeVersion(item))
-        .filter((item: FlowVersion | undefined): item is FlowVersion => Boolean(item));
+    const result = await this.runJson<{ history: unknown[] }>([
+      "history",
+      "--path",
+      this.workspaceRoot,
+    ]);
+    if (!result || result.ok !== true || !Array.isArray(result.history)) {
+      return [];
     }
-
-    const text = await this.runRaw(["history", "--path", this.workspaceRoot], false);
-    return this.parseHistoryText(text);
+    return result.history
+      .map((item) => this.normalizeVersion(item))
+      .filter((item): item is FlowVersion => Boolean(item));
   }
 
   public async getVersionFileContent(
     versionRef: string,
     relativePath: string
   ): Promise<string | undefined> {
-    const root = this.workspaceRoot;
-    const script = `
-import json
-import sys
-from engine import FlowStateEngine
-
-root = sys.argv[1]
-version_ref = sys.argv[2]
-rel_path = sys.argv[3].replace('\\\\\\\\', '/')
-engine = FlowStateEngine(root)
-with engine._conn() as conn:
-    row = engine._version_row(conn, version_ref)
-    files = engine._collect_files_from_tree(conn, row["root_tree_hash"])
-    object_hash = files.get(rel_path)
-    if object_hash is None:
-        print(json.dumps({"ok": False, "missing": True}))
-    else:
-        data = engine._get_object_content(conn, object_hash)
-        print(json.dumps({"ok": True, "content": data.decode("utf-8", errors="replace")}))
-`.trim();
-
-    const parsed = await this.runPythonInline(script, [root, versionRef, relativePath]);
-    if (parsed && parsed.ok === true && typeof parsed.content === "string") {
-      return parsed.content;
+    const result = await this.runJson<{ missing: boolean; content: string | null }>([
+      "show",
+      versionRef,
+      relativePath,
+      "--path",
+      this.workspaceRoot,
+    ]);
+    if (!result || result.ok !== true || result.missing) {
+      return undefined;
     }
-    return undefined;
+    return typeof result.content === "string" ? result.content : undefined;
   }
 
   private normalizeVersion(item: unknown): FlowVersion | undefined {
@@ -221,7 +238,12 @@ with engine._conn() as conn:
       return undefined;
     }
 
-    const kind: FlowVersion["kind"] = name.startsWith("auto-")
+    const explicitKind =
+      typeof raw.kind === "string" && ["manual", "auto", "temp"].includes(raw.kind)
+        ? (raw.kind as FlowVersion["kind"])
+        : undefined;
+
+    const inferredKind: FlowVersion["kind"] = name.startsWith("auto-")
       ? "auto"
       : name === "temp" || name.startsWith("temp-")
       ? "temp"
@@ -234,88 +256,8 @@ with engine._conn() as conn:
       parent2_id: raw.parent2_id === null ? null : Number(raw.parent2_id ?? NaN),
       message: String(raw.message ?? ""),
       timestamp: String(raw.timestamp ?? ""),
-      kind
+      kind: explicitKind ?? inferredKind,
     };
-  }
-
-  private parseHistoryText(text: string): FlowVersion[] {
-    const versions: FlowVersion[] = [];
-    const lines = text.split(/\r?\n/);
-    let sectionKind: FlowVersion["kind"] | undefined;
-
-    for (const rawLine of lines) {
-      const line = rawLine.trimEnd();
-      const normalized = line.trim();
-      if (!normalized) {
-        continue;
-      }
-
-      if (normalized.startsWith("Versions:")) {
-        sectionKind = "manual";
-        continue;
-      }
-      if (normalized.startsWith("Auto-Saves:")) {
-        sectionKind = "auto";
-        continue;
-      }
-      if (normalized.startsWith("Temp Saves:")) {
-        sectionKind = "temp";
-        continue;
-      }
-
-      const currentFormat =
-        /^\s*(\d+)\s+\[(VERSION|AUTO|TEMP)\]\s+(\S+)\s+\(Saved:\s*([^)]+)\)\s+parents=\[([^\]]*)\]\s*(.*)$/.exec(
-          line
-        );
-      if (currentFormat) {
-        const id = Number(currentFormat[1]);
-        const label = currentFormat[2];
-        const name = currentFormat[3];
-        const message = currentFormat[6] ?? "";
-        const kind: FlowVersion["kind"] =
-          label === "AUTO" ? "auto" : label === "TEMP" ? "temp" : "manual";
-
-        versions.push({
-          id,
-          name,
-          parent1_id: null,
-          parent2_id: null,
-          message: message.trim(),
-          timestamp: currentFormat[4].trim(),
-          kind
-        });
-        continue;
-      }
-
-      const oldFormat =
-        /^\s*(\d+)\s+(\S+)\s+parents=\[([^\]]*)\]\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*(.*)$/.exec(
-          line
-        );
-      if (oldFormat) {
-        const id = Number(oldFormat[1]);
-        const name = oldFormat[2];
-        const timestamp = oldFormat[4];
-        const message = (oldFormat[5] ?? "").trim();
-        const kind: FlowVersion["kind"] =
-          sectionKind ??
-          (name.startsWith("auto-")
-            ? "auto"
-            : name === "temp" || name.startsWith("temp-")
-            ? "temp"
-            : "manual");
-        versions.push({
-          id,
-          name,
-          parent1_id: null,
-          parent2_id: null,
-          message,
-          timestamp,
-          kind
-        });
-      }
-    }
-
-    return versions.sort((a, b) => a.id - b.id);
   }
 
   private async runBestEffort(args: string[]): Promise<string> {
@@ -326,10 +268,14 @@ with engine._conn() as conn:
     }
   }
 
-  private async runJsonIfSupported(args: string[]): Promise<any | undefined> {
+  private async runJson<T>(args: string[]): Promise<CliJsonResult<T> | undefined> {
     try {
       const raw = await this.runRaw(args, true);
-      return JSON.parse(raw);
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        return parsed as CliJsonResult<T>;
+      }
+      return undefined;
     } catch {
       return undefined;
     }
@@ -351,41 +297,6 @@ with engine._conn() as conn:
 
     const result = await this.execPython(cliPath, cliArgs, this.workspaceRoot);
     return result.stdout.trim();
-  }
-
-  private async runPythonInline(script: string, scriptArgs: string[]): Promise<any | undefined> {
-    const cliPath = this.cliPath;
-    if (!fs.existsSync(cliPath)) {
-      return undefined;
-    }
-    const python = this.resolvePythonSpec();
-    const execArgs = [...python.prefixArgs, "-c", script, ...scriptArgs];
-    try {
-      const result = await this.execFileAsync(
-        python.command,
-        execArgs,
-        path.dirname(cliPath)
-      );
-      return JSON.parse(result.stdout.trim());
-    } catch {
-      return undefined;
-    }
-  }
-
-  private async createTempSnapshot(message: string): Promise<void> {
-    const script = `
-import json
-import sys
-from engine import FlowStateEngine
-
-engine = FlowStateEngine(sys.argv[1])
-snapshot = engine.take_snapshot(message=sys.argv[2], name_prefix="temp")
-print(json.dumps({"ok": True, "created": snapshot is not None}))
-`.trim();
-    const parsed = await this.runPythonInline(script, [this.workspaceRoot, message]);
-    if (!parsed || parsed.ok !== true) {
-      throw new Error("Failed to create temporary snapshot.");
-    }
   }
 
   private async execPython(cliPath: string, args: string[], cwd: string): Promise<ExecResult> {
@@ -425,7 +336,12 @@ print(json.dumps({"ok": True, "created": snapshot is not None}))
       execFile(
         command,
         args,
-        { cwd, windowsHide: true, maxBuffer: 10 * 1024 * 1024 },
+        {
+          cwd,
+          windowsHide: true,
+          maxBuffer: 10 * 1024 * 1024,
+          env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+        },
         (error, stdout, stderr) => {
           if (error) {
             reject(

@@ -1,0 +1,4 @@
+# FlowState runtime dependencies.
+# The CLI and the engine itself rely only on the Python standard library.
+# Streamlit is required for the optional Web UI (`streamlit run app.py`).
+streamlit>=1.30,<2.0

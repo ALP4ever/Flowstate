@@ -58,16 +58,48 @@ def initialize_database(project_root: Path) -> Path:
     objects_path(project_root).mkdir(parents=True, exist_ok=True)
 
     db_path = database_path(project_root)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(SCHEMA_SQL)
         conn.commit()
+    finally:
+        conn.close()
 
     return db_path
 
 
 def is_initialized(project_root: Path) -> bool:
     return database_path(project_root).exists()
+
+
+REQUIRED_TABLES = ("versions", "objects", "tree_entries")
+
+
+def verify_schema(project_root: Path) -> tuple[bool, str | None]:
+    """Return (ok, error). Checks DB exists and contains the expected tables."""
+
+    db_path = database_path(project_root)
+    if not db_path.exists():
+        return False, f"FlowState database not found at {db_path}."
+
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as exc:
+        return False, f"FlowState database appears corrupted: {exc}"
+
+    table_names = {row[0] for row in rows}
+    missing = [t for t in REQUIRED_TABLES if t not in table_names]
+    if missing:
+        return False, f"FlowState schema is incomplete; missing tables: {', '.join(missing)}."
+
+    return True, None
 
 
 def get_connection(project_root: Path) -> sqlite3.Connection:

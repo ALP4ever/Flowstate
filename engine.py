@@ -3,9 +3,12 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
+import stat
+import tempfile
 import zlib
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -30,6 +33,20 @@ class FlowStateEngine:
     AUTO_PREFIX = "auto-"
     TEMP_NAME = "temp"
     TEMP_PREFIX = "temp-"
+    DEFAULT_IGNORE_PATTERNS = [
+        ".git/",
+        "node_modules/",
+        "__pycache__/",
+        "*.pyc",
+        "*.pyo",
+        "*.pyd",
+        ".DS_Store",
+        "Thumbs.db",
+    ]
+    PROTECTED_CHECKOUT_NAMES = {
+        FLOWSTATE_DIR,
+        ".git",
+    }
 
     def __init__(self, project_root: Path | str = ".", auto_init: bool = False) -> None:
         self.project_root = Path(project_root).resolve()
@@ -43,8 +60,31 @@ class FlowStateEngine:
         self.objects_dir = objects_path(self.project_root)
         self.objects_dir.mkdir(parents=True, exist_ok=True)
 
+    def _flowstate_dir(self) -> Path:
+        return self.project_root / FLOWSTATE_DIR
+
+    def _logs_dir(self) -> Path:
+        return self._flowstate_dir() / "logs"
+
+    def _log_event(self, event: str, **fields: Any) -> None:
+        """Append a JSONL audit record without interrupting the user operation."""
+
+        try:
+            self._logs_dir().mkdir(parents=True, exist_ok=True)
+            record = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "event": event,
+                **fields,
+            }
+            log_path = self._logs_dir() / "flowstate.log"
+            with log_path.open("a", encoding="utf-8") as fp:
+                fp.write(json.dumps(record, ensure_ascii=False, default=str))
+                fp.write("\n")
+        except OSError:
+            pass
+
     def _state_file_path(self) -> Path:
-        return self.project_root / FLOWSTATE_DIR / "state.json"
+        return self._flowstate_dir() / "state.json"
 
     def _read_state(self) -> dict[str, Any]:
         state_path = self._state_file_path()
@@ -136,17 +176,30 @@ class FlowStateEngine:
         return name == cls.TEMP_NAME or name.startswith(cls.TEMP_PREFIX)
 
     def _load_flowignore_patterns(self) -> list[str]:
-        ignore_file = self.project_root / ".flowignore"
-        if not ignore_file.exists():
-            return []
-
-        patterns: list[str] = []
-        for raw_line in ignore_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
+        patterns = list(self.DEFAULT_IGNORE_PATTERNS)
+        for ignore_file in (self.project_root / ".flowignore", self.project_root / ".flowstateignore"):
+            if not ignore_file.exists():
                 continue
-            patterns.append(line.replace("\\", "/"))
+            for raw_line in ignore_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                patterns.append(line.replace("\\", "/"))
         return patterns
+
+    @staticmethod
+    def _on_rm_error(func: Any, path: str, exc_info: Any) -> None:
+        _ = exc_info
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+
+    def _remove_working_tree_entry(self, child: Path) -> None:
+        if child.name in self.PROTECTED_CHECKOUT_NAMES:
+            return
+        if child.is_dir():
+            shutil.rmtree(child, onexc=self._on_rm_error)
+        else:
+            child.unlink()
 
     def _is_ignored_path(
         self, rel_path: str, is_dir: bool, ignore_patterns: list[str]
@@ -217,7 +270,15 @@ class FlowStateEngine:
         path = self._object_file_path(object_hash)
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(compressed)
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                tmp.write(compressed)
+                tmp_path = Path(tmp.name)
+            tmp_path.replace(path)
 
         return object_hash
 
@@ -234,9 +295,13 @@ class FlowStateEngine:
             data = row["content"]
 
         try:
-            return zlib.decompress(data)
+            content = zlib.decompress(data)
         except zlib.error:
-            return data
+            content = data
+
+        if self._sha256(content) != object_hash:
+            raise FlowStateError(f"Object {object_hash} failed SHA-256 verification.")
+        return content
 
     @staticmethod
     def _hash_tree_entries(entries: list[tuple[str, str, bool]]) -> str:
@@ -623,6 +688,14 @@ class FlowStateEngine:
         if deleted_temp_ids:
             self._clear_state_references(deleted_temp_ids)
 
+        self._log_event(
+            "snapshot",
+            id=created_id,
+            name=str(created["name"]),
+            auto=bool(auto),
+            temp=self._is_temp_version_name(str(created["name"])),
+            message=str(created.get("message") or ""),
+        )
         return created
 
     def is_dirty(self, baseline: str = "current") -> bool:
@@ -644,12 +717,7 @@ class FlowStateEngine:
             version = self._version_row(conn, version_id)
             files = self._collect_files_from_tree(conn, version["root_tree_hash"])
             for child in self.project_root.iterdir():
-                if child.name == FLOWSTATE_DIR:
-                    continue
-                if child.is_dir():
-                    shutil.rmtree(child)
-                else:
-                    child.unlink()
+                self._remove_working_tree_entry(child)
 
             for rel_path, object_hash in files.items():
                 target = self.project_root / Path(rel_path)
@@ -658,6 +726,12 @@ class FlowStateEngine:
 
             checked_out = dict(version)
             self._set_current_version_id(int(checked_out["id"]))
+            self._log_event(
+                "checkout",
+                id=int(checked_out["id"]),
+                name=str(checked_out["name"]),
+                file_count=len(files),
+            )
             return checked_out
 
     def _find_common_ancestor(
@@ -786,6 +860,14 @@ class FlowStateEngine:
                 message=merge_message,
             )
             merged_version["conflicts"] = conflicts
+            self._log_event(
+                "merge",
+                id=int(merged_version["id"]),
+                name=str(merged_version["name"]),
+                parent1_id=a_id,
+                parent2_id=b_id,
+                conflicts=conflicts,
+            )
             return merged_version
 
     def get_history(self) -> list[dict[str, Any]]:
@@ -1056,6 +1138,7 @@ class FlowStateEngine:
         deleted_ids = set(delete_result["deleted_ids"])
         self._clear_state_references(deleted_ids)
         gc_result = self.gc()
+        self._log_event("prune_temp", deleted_ids=sorted(deleted_ids))
         return {
             "deleted_ids": sorted(deleted_ids),
             "pruned_tree_entries": delete_result["pruned_tree_entries"],
@@ -1096,6 +1179,7 @@ class FlowStateEngine:
         deleted_ids = set(delete_result["deleted_ids"])
         self._clear_state_references(deleted_ids)
         gc_result = self.gc()
+        self._log_event("delete", deleted_ids=sorted(deleted_ids))
         return {
             "deleted_ids": sorted(deleted_ids),
             "pruned_tree_entries": delete_result["pruned_tree_entries"],
@@ -1195,6 +1279,12 @@ class FlowStateEngine:
         deleted_ids = set(delete_result["deleted_ids"])
         self._clear_state_references(deleted_ids)
         gc_result = self.gc()
+        self._log_event(
+            "clean",
+            all_versions=all_versions,
+            deleted_ids=sorted(deleted_ids),
+            skipped_protected=skipped_protected,
+        )
         return {
             "deleted_ids": sorted(deleted_ids),
             "skipped_protected": skipped_protected,
@@ -1235,6 +1325,11 @@ class FlowStateEngine:
             if dir_path.is_dir() and not any(dir_path.iterdir()):
                 dir_path.rmdir()
 
+        self._log_event(
+            "gc",
+            deleted_db_objects=len(stale_db),
+            deleted_disk_objects=deleted_disk,
+        )
         return {
             "deleted_db_objects": len(stale_db),
             "deleted_disk_objects": deleted_disk,

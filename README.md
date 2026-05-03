@@ -7,6 +7,58 @@ FlowState - локальная snapshot-ориентированная VCS с п
 - Merge: `v1 + v2 = v3` (новая неизменяемая версия с двумя родителями).
 - Local-first + content-addressable storage (SHA-256).
 
+## 0. Quick start (5 минут)
+
+Минимальные требования: Python 3.10+, опционально Node.js 18+ для VS Code расширения.
+
+1. Создать виртуальное окружение и поставить зависимости:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+2. Инициализировать репозиторий и сделать первый snapshot:
+
+```powershell
+python cli.py init .
+python cli.py save -m "initial"
+python cli.py history
+```
+
+3. Получить машиночитаемый статус (используется VS Code расширением):
+
+```powershell
+python cli.py status --json
+python cli.py history --json
+python cli.py diff v1 v2 --json
+```
+
+4. (Опционально) Streamlit UI:
+
+```powershell
+streamlit run app.py
+```
+
+5. (Опционально) Сборка VS Code расширения:
+
+```powershell
+npm install
+npm run compile
+```
+
+6. (Опционально) Dev-проверки:
+
+```powershell
+pip install -r requirements-dev.txt
+ruff check .
+pytest
+npm run compile
+```
+
+Подробнее об архитектуре, командах и UI - в разделах ниже.
+
 ## 1. Что делает система
 
 FlowState хранит историю версий в SQLite и контент файлов по хешу SHA-256:
@@ -44,7 +96,7 @@ FlowState хранит историю версий в SQLite и контент �
 `take_snapshot(message)`:
 
 1. Рекурсивно сканирует рабочую директорию (кроме `.flowstate`).
-   - учитывает правила из `.flowignore` (простые glob-шаблоны, например `*.pyc`, `__pycache__/`, `node_modules/`).
+   - учитывает правила из `.flowignore` и `.flowstateignore` (простые glob-шаблоны, например `*.pyc`, `__pycache__/`, `node_modules/`).
 2. Для каждого файла считает SHA-256.
 3. Сохраняет содержимое в CAS (`objects` + `.flowstate/objects/`), если такого хеша еще нет.
 4. Строит хеши поддеревьев и корневой `root_tree_hash`.
@@ -115,6 +167,17 @@ python cli.py checkout v2 --path .
 python cli.py merge v1 v2 -m "Merge v1 + v2" --path .
 ```
 
+- Сравнение двух версий:
+```powershell
+python cli.py diff v1 v2 --path .
+```
+
+- Экспорт/импорт хранилища:
+```powershell
+python cli.py export flowstate-backup.zip --path .
+python cli.py import flowstate-backup.zip --path ./restored-project
+```
+
 - Запуск watcher (background по умолчанию, каждые 15 минут):
 ```powershell
 python cli.py watch --path .
@@ -126,6 +189,28 @@ python cli.py watch --path . --foreground
 ```
 
 Поддерживаются ссылки на версию как по `id`, так и по `name` (`v1`, `v2`, ...).
+
+### JSON API CLI
+
+Любая команда поддерживает флаг `--json` для машиночитаемого вывода
+(используется в том числе VS Code расширением):
+
+```powershell
+python cli.py status --json
+python cli.py history --json
+python cli.py save -m "initial" --json
+python cli.py show v2 src/main.py --json
+python cli.py diff v1 v2 --json
+python cli.py export backup.zip --json
+```
+
+При ошибке возвращается `{"ok": false, "error": "..."}` и код возврата `1`.
+Дополнительные служебные команды:
+
+- `is-init --json` - проверка, что в каталоге проинициализирован FlowState и БД проходит схема-чек.
+- `status --json` - текущая/последняя версия и dirty-флаг.
+- `show <version> <file> --json` - содержимое файла из выбранной версии (utf-8 с заменой нечитаемых байтов).
+- `diff <from> <to> --json` - списки `added`, `modified`, `removed` между двумя версиями.
 
 ## 8. UI (Streamlit)
 
@@ -178,7 +263,12 @@ print(v3["name"])
   objects/
     ab/
       cdef...   # zlib-сжатый blob, имя = sha256
+  logs/
+    flowstate.log   # JSONL audit-log операций
 ```
+
+При чтении объекта FlowState повторно проверяет SHA-256. Если объект поврежден,
+операция завершается ошибкой вместо восстановления неверного содержимого.
 
 ## 11. Ограничения текущей версии
 
@@ -230,7 +320,7 @@ python cli.py delete v15 --recursive --path .
 ```
 
 - Without flags: deletion is blocked when version has children.
-- Error text: `?????? ???????? ??????? ??? vN. ??????? ??????? ????????`.
+- Error text сообщает, что версия является предком другой версии и ее нельзя удалить без `--force` или удаления потомков.
 - `--force`: detaches children and deletes target.
 - `--recursive`: deletes target plus removable ancestors.
 - `gc()` runs automatically after deletion.
@@ -267,3 +357,18 @@ To reduce temp snapshot noise:
 - During checkout, if the current dirty tree is identical to the already protected temp snapshot, FlowState reuses it instead of creating a new one.
 - FlowState auto-prunes temp snapshots to keep the latest 3 (`temp-*`) while preserving the currently protected recovery snapshot.
 - Protection is consumed after `back` and then `clean --all` can remove old temp snapshots.
+
+## 17. Developer quality gates
+
+Для локальной проверки перед коммитом:
+
+```powershell
+pip install -r requirements-dev.txt
+ruff check .
+pytest
+npm ci
+npm run compile
+```
+
+CI описан в `.github/workflows/ci.yml` и выполняет те же основные проверки:
+Python lint, Python tests и TypeScript compile.
