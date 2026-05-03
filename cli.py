@@ -173,8 +173,6 @@ def cmd_checkout(args: argparse.Namespace) -> None:
             create_temp = True
         elif args.no_temp:
             create_temp = False
-        elif _is_json(args):
-            create_temp = False
         elif sys.stdin.isatty():
             answer = input(
                 "Unsaved changes detected. Create temporary snapshot 'temp' before checkout? [y/N]: "
